@@ -2,6 +2,7 @@ import { spawn } from 'child_process';
 import readline from 'readline';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import { SUPER_TOOLS, TOOL_HANDLERS } from './tool_registry.js';
@@ -10,7 +11,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // 1. Spawn official Roblox StudioMCP.exe Subprocess safely
 function getOfficialStudioMCPPath() {
-    const robloxBase = 'C:\\Users\\win\\AppData\\Local\\Roblox\\Versions';
+    const robloxBase = path.join(os.homedir(), 'AppData', 'Local', 'Roblox', 'Versions');
     if (fs.existsSync(robloxBase)) {
         const candidates = fs.readdirSync(robloxBase)
             .map(version => path.join(robloxBase, version, 'StudioMCP.exe'))

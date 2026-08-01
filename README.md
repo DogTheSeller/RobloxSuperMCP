@@ -1,63 +1,61 @@
 # Roblox Super MCP
 
 Roblox Super MCP is a Node.js MCP server that connects an MCP client to the
-official Roblox Studio MCP process. It adds evidence-driven discovery, live
-audits, atomic script edits, verification, and rollback-oriented tools.
+official Roblox Studio MCP process. It adds discovery, inspection, auditing,
+atomic script edits, verification, and rollback-oriented tools.
 
 ## Requirements
 
 - Windows
 - Roblox Studio with the official `StudioMCP.exe`
 - Node.js 18 or newer
-- An MCP client that supports a JSON MCP server configuration
+- An MCP-compatible client
 
 ## Install and test
 
-Open PowerShell in this folder:
+From the project directory, run:
 
 ```powershell
-cd H:\TestingNEWMCP
 npm install
 npm test
 node server.js
 ```
 
-Stop `node server.js` with `Ctrl+C` after confirming it starts successfully.
+The server communicates over standard input and output. Stop the manual test
+with `Ctrl+C` after confirming it starts successfully.
 
-## Replace the old MCP launcher
+## Replace an existing MCP launcher
 
-1. Find the existing `mcp.bat` or MCP launcher used by your MCP client.
-2. Make a backup before changing it, for example:
+If your current setup starts the original MCP through an `mcp.bat` file:
 
-   ```powershell
-   Copy-Item .\mcp.bat .\mcp.bat.backup
-   ```
-
-3. Replace its contents with the following, updating the path if this project
-   is stored somewhere else:
+1. Back up the existing launcher.
+2. Replace its contents with:
 
    ```bat
    @echo off
-   cd /d H:\TestingNEWMCP
+   cd /d "<path-to-this-project>"
    node server.js
    ```
 
-4. Restart the MCP client and Roblox Studio connection.
+   Replace `<path-to-this-project>` with the folder where you cloned this
+   repository. Keep the quotes if the path contains spaces.
 
-The launcher must keep the server attached to standard input and output. Do
-not add logging or other text to stdout because it can corrupt MCP messages.
+3. Restart the MCP client and Roblox Studio connection.
+
+Do not print diagnostic messages to standard output. MCP messages use that
+stream; diagnostics should go to standard error or a log file.
 
 ## Configure an MCP client directly
 
-Instead of using a batch file, add the contents of `mcp-config.json` to your
-client configuration:
+You can configure the client without a batch file. Add this server entry and
+replace the example path with the location of your local clone:
 
 ```json
 {
   "mcpServers": {
     "roblox-super-mcp": {
       "command": "node",
-      "args": ["H:/TestingNEWMCP/server.js"]
+      "args": ["<path-to-this-project>/server.js"]
     }
   }
 }
@@ -67,24 +65,20 @@ Use forward slashes in JSON paths, or escape Windows backslashes as `\\`.
 
 ## How it works
 
-`server.js` starts the latest Roblox `StudioMCP.exe` found under:
-
-```text
-C:\Users\win\AppData\Local\Roblox\Versions
-```
-
-It then exposes the tools registered in `tool_registry.js`. The `tools`
-directory contains the discovery, inspection, auditing, editing, verification,
-and rollback helpers.
+When started, the server locates the newest Roblox `StudioMCP.exe` in the
+current Windows user's Roblox installation, starts it, and forwards validated
+MCP requests to it. The available tool definitions are registered in
+`tool_registry.js`; implementation helpers live in the `tools` directory.
 
 ## Updating
 
-Pull the latest version, then restart the MCP client:
+Pull the latest version, test it, and restart the MCP client:
 
 ```powershell
 git pull
+npm install
 npm test
 ```
 
-Keep the original launcher backup until the new MCP has been tested in Roblox
-Studio.
+Keep a backup of the previous launcher until the replacement has been tested
+in Roblox Studio.

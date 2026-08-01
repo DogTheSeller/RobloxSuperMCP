@@ -1,0 +1,5 @@
+# Local MCP indexes and transaction history may contain project-specific data.
+project_brain.json
+.transactions/
+node_modules/
+*.log
