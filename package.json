@@ -1,0 +1,11 @@
+{
+  "name": "roblox-super-mcp",
+  "version": "3.0.1",
+  "description": "Transactional Roblox Studio engineering MCP with evidence-driven discovery, live audits, atomic edits, verification, and rollback",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  }
+}

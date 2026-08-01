@@ -1,0 +1,65 @@
+{
+  "SchemaVersion": 4,
+  "ScannedAt": "2026-07-30T00:00:00.000Z",
+  "PlaceIdentity": {
+    "Name": "SuperMCP Test Place",
+    "PlaceId": 123,
+    "GameId": 456,
+    "CreatorId": 789
+  },
+  "AllItems": [
+    {
+      "Name": "TradeConfig",
+      "Class": "ModuleScript",
+      "Path": "ReplicatedStorage.Trade.TradeConfig",
+      "Category": "ReplicatedStorage",
+      "SourceReadable": true,
+      "SearchTerms": ["Trading", "Offer"],
+      "Functions": ["TradeConfig.GetLimit"]
+    },
+    {
+      "Name": "TradeService",
+      "Class": "ModuleScript",
+      "Path": "ServerScriptService.Services.TradeService",
+      "Category": "ServerScriptService",
+      "SourceReadable": true,
+      "SourceHash": "x",
+      "Requires": ["TradeConfig"],
+      "ServicesUsed": ["DataStoreService"],
+      "RemoteUsage": [
+        {"Name": "TradeEvent", "Symbol": "tradeRemote", "Method": "OnServerEvent"},
+        {"Name": "TradeEvent", "Symbol": "tradeRemote", "Method": "FireClient"}
+      ],
+      "DataStoreUsage": [{"Name": "PlayerTrades", "Method": "GetDataStore"}],
+      "Functions": ["TradeService.AcceptOffer"]
+    },
+    {
+      "Name": "TradingClient",
+      "Class": "ModuleScript",
+      "Path": "StarterPlayer.StarterPlayerScripts.TradingClient",
+      "Category": "StarterPlayer",
+      "SourceReadable": true,
+      "SourceHash": "y",
+      "Requires": ["TradeService"],
+      "RemoteUsage": [
+        {"Name": "TradeEvent", "Symbol": "tradeRemote", "Method": "FireServer"},
+        {"Name": "TradeEvent", "Symbol": "tradeRemote", "Method": "OnClientEvent"}
+      ],
+      "Functions": ["requestTrade"]
+    },
+    {
+      "Name": "TradeMenu",
+      "Class": "LocalScript",
+      "Path": "StarterGui.Main.Trading.TradeMenu",
+      "Category": "StarterGui",
+      "SourceReadable": true,
+      "Requires": ["TradingClient"]
+    },
+    {
+      "Name": "TradeEvent",
+      "Class": "RemoteEvent",
+      "Path": "ReplicatedStorage.Remotes.TradeEvent",
+      "Category": "ReplicatedStorage"
+    }
+  ]
+}

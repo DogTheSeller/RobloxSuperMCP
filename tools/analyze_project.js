@@ -1,0 +1,550 @@
+import {
+    BRAIN_SCHEMA_VERSION,
+    cacheMetadata,
+    loadBrain,
+    placeIdentitiesMatch,
+    saveBrain
+} from './brain_store.js';
+import { executeLuau } from './studio_utils.js';
+
+export const LUAU_SCANNER_SCRIPT = `
+local HttpService = game:GetService("HttpService")
+
+local MAX_SEARCH_TERMS = 120
+local MAX_RECORDS = 100
+local MAX_PAGE_BYTES = 70000
+local SCAN_CATEGORY = "__SCAN_CATEGORY__"
+local SCAN_OFFSET = __SCAN_OFFSET__
+local SCAN_LIMIT = __SCAN_LIMIT__
+local categories = {SCAN_CATEGORY}
+local items = {}
+local hasMore = false
+local encodedBytes = 80
+local oversizedItems = {}
+
+local function uniqueSorted(values, limit)
+    local seen = {}
+    local result = {}
+    for _, value in values do
+        if value ~= "" and not seen[value] then
+            seen[value] = true
+            table.insert(result, value)
+            if limit and #result >= limit then break end
+        end
+    end
+    table.sort(result)
+    return result
+end
+
+local function collectRecords(source, pattern, method)
+    local records = {}
+    local cursor = 1
+    while cursor <= #source do
+        local first, last, name = string.find(source, pattern, cursor)
+        if not first then break end
+        local _, lineBreaks = string.gsub(string.sub(source, 1, first - 1), "\\n", "")
+        table.insert(records, {Name = name, Method = method, Line = lineBreaks + 1})
+        if #records >= MAX_RECORDS then break end
+        cursor = math.max(last + 1, first + 1)
+    end
+    return records
+end
+
+local function appendRecords(target, source)
+    for _, record in source do
+        if #target >= MAX_RECORDS then break end
+        table.insert(target, record)
+    end
+end
+
+local function sourceFingerprint(source)
+    local hash = 0
+    for index = 1, #source do
+        hash = bit32.band(hash + string.byte(source, index), 0xffffffff)
+        hash = bit32.band(hash + bit32.lshift(hash, 10), 0xffffffff)
+        hash = bit32.bxor(hash, bit32.rshift(hash, 6))
+    end
+    hash = bit32.band(hash + bit32.lshift(hash, 3), 0xffffffff)
+    hash = bit32.bxor(hash, bit32.rshift(hash, 11))
+    hash = bit32.band(hash + bit32.lshift(hash, 15), 0xffffffff)
+    return tostring(#source) .. ":" .. string.format("%08x", hash)
+end
+
+local function stripComments(source)
+    local output = table.create(#source)
+    local index = 1
+    local quote = nil
+    local preserveString = false
+    local function shouldPreserveLiteral(position)
+        local prefix = string.sub(source, math.max(1, position - 100), position - 1)
+        return string.match(prefix, "GetService%s*%(%s*$") ~= nil or
+            string.match(prefix, "[GS]etAttribute%s*%(%s*$") ~= nil or
+            string.match(prefix, "GetDataStore%s*%(%s*$") ~= nil or
+            string.match(prefix, "GetOrderedDataStore%s*%(%s*$") ~= nil or
+            string.match(prefix, "WaitForChild%s*%(%s*$") ~= nil or
+            string.match(prefix, "FindFirstChild%s*%(%s*$") ~= nil or
+            string.match(prefix, "require%s*%(%s*$") ~= nil
+    end
+    while index <= #source do
+        local character = string.sub(source, index, index)
+        local nextCharacter = string.sub(source, index + 1, index + 1)
+        if quote then
+            if character == "\\\\" then
+                table.insert(output, preserveString and character or " ")
+                if index < #source then
+                    index += 1
+                    local escaped = string.sub(source, index, index)
+                    table.insert(output, preserveString and escaped or (escaped == "\\n" and "\\n" or " "))
+                end
+            elseif character == quote then
+                table.insert(output, character)
+                quote = nil
+                preserveString = false
+            else
+                table.insert(output, preserveString and character or (character == "\\n" and "\\n" or " "))
+            end
+        elseif character == "\\"" or character == "'" then
+            quote = character
+            preserveString = shouldPreserveLiteral(index)
+            table.insert(output, character)
+        elseif character == "[" then
+            local remainder = string.sub(source, index)
+            local openerStart, relativeOpenerEnd, equals = string.find(remainder, "^%[(=*)%[")
+            if openerStart then
+                local openerEnd = index - 1 + relativeOpenerEnd
+                local closePattern = "]" .. equals .. "]"
+                local _, closeEnd = string.find(source, closePattern, openerEnd + 1, true)
+                local stringEnd = closeEnd or #source
+                for stringIndex = index, stringEnd do
+                    local stringCharacter = string.sub(source, stringIndex, stringIndex)
+                    table.insert(output, stringCharacter == "\\n" and "\\n" or " ")
+                end
+                index = stringEnd
+            else
+                table.insert(output, character)
+            end
+        elseif character == "-" and nextCharacter == "-" then
+            local remainder = string.sub(source, index + 2)
+            local openerStart, relativeOpenerEnd, equals = string.find(remainder, "^%[(=*)%[")
+            if openerStart then
+                local openerEnd = index + 1 + relativeOpenerEnd
+                local closePattern = "]" .. equals .. "]"
+                local closeStart, closeEnd = string.find(source, closePattern, openerEnd + 1, true)
+                local commentEnd = closeEnd or #source
+                for commentIndex = index, commentEnd do
+                    local commentCharacter = string.sub(source, commentIndex, commentIndex)
+                    table.insert(output, commentCharacter == "\\n" and "\\n" or " ")
+                end
+                index = commentEnd
+            else
+                while index <= #source and string.sub(source, index, index) ~= "\\n" do
+                    table.insert(output, " ")
+                    index += 1
+                end
+                if index <= #source then table.insert(output, "\\n") end
+            end
+        else
+            table.insert(output, character)
+        end
+        index += 1
+    end
+    return table.concat(output)
+end
+
+local function inspectSource(container)
+    local ok, source = pcall(function()
+        return container.Source
+    end)
+    if not ok then
+        return {
+            Requires = {},
+            ServicesUsed = {},
+            SearchTerms = {},
+            RemoteUsage = {},
+            DataStoreUsage = {},
+            Attributes = {},
+            AttributeUsage = {},
+            Functions = {},
+            Calls = {},
+            SourceReadable = false,
+        }
+    end
+    local originalSource = source
+    source = stripComments(source)
+
+    local requires = {}
+    local servicesUsed = {}
+    local searchTerms = {}
+    local attributes = {}
+    local attributeUsage = {}
+    local functions = {}
+    local calls = {}
+    local remoteUsage = {}
+    local dataStoreUsage = {}
+    local remoteAliases = {}
+
+    for target in string.gmatch(source, "require%s*%(%s*([^%)]+)") do
+        local name = string.match(target, "[\\"']([^%\\"']+)[\\"']") or
+            string.match(target, "([%a_][%w_]*)%s*$")
+        if name then name = string.match(name, "^%s*(.-)%s*$") end
+        if name and name ~= "require" and name ~= "script" then
+            table.insert(requires, name)
+        end
+    end
+    for service in string.gmatch(source, "GetService%s*%(%s*[\\"']([%w_]+)[\\"']%s*%)") do
+        table.insert(servicesUsed, service)
+    end
+    for method, attribute in string.gmatch(source, "([GS]etAttribute)%s*%(%s*[\\"']([^%\\"']+)[\\"']") do
+        table.insert(attributes, attribute)
+        table.insert(attributeUsage, {Name = attribute, Method = method})
+    end
+    for functionName in string.gmatch(source, "function%s+([%w_%.:]+)%s*%(") do
+        table.insert(functions, functionName)
+    end
+    for functionName in string.gmatch(source, "local%s+function%s+([%w_]+)%s*%(") do
+        table.insert(functions, functionName)
+    end
+    local callSource = string.gsub(source, "function%s+[%w_%.:]+%s*%(", function(declaration)
+        return string.rep(" ", #declaration)
+    end)
+    for callName in string.gmatch(callSource, "[%w_%)%]]+[%.:]([%a_][%w_]*)%s*%(") do
+        table.insert(calls, callName)
+        if #calls >= MAX_RECORDS then break end
+    end
+    for storeName in string.gmatch(source, "GetDataStore%s*%(%s*[\\"']([^%\\"']+)[\\"']") do
+        table.insert(dataStoreUsage, {Name = storeName, Method = "GetDataStore"})
+        if #dataStoreUsage >= MAX_RECORDS then break end
+    end
+    for symbol, remoteName in string.gmatch(source, "local%s+([%w_]+)%s*=%s*[^\\n]-WaitForChild%s*%(%s*[\\"']([^%\\"']+)[\\"']") do
+        remoteAliases[symbol] = remoteName
+    end
+    for symbol, remoteName in string.gmatch(source, "local%s+([%w_]+)%s*=%s*[^\\n]-FindFirstChild%s*%(%s*[\\"']([^%\\"']+)[\\"']") do
+        remoteAliases[symbol] = remoteName
+    end
+
+    local remoteMethods = {
+        "FireServer", "InvokeServer", "FireClient", "FireAllClients",
+        "InvokeClient", "OnServerEvent", "OnServerInvoke", "OnClientEvent", "OnClientInvoke"
+    }
+    for _, method in remoteMethods do
+        local colonPattern = "([%w_]+)%s*:%s*" .. method .. "%s*%("
+        local dotPattern = "([%w_]+)%s*%." .. method
+        appendRecords(remoteUsage, collectRecords(source, colonPattern, method))
+        appendRecords(remoteUsage, collectRecords(source, dotPattern, method))
+    end
+    for _, record in remoteUsage do
+        record.Symbol = record.Name
+        record.Name = remoteAliases[record.Name] or record.Name
+    end
+
+    local seenTerms = {}
+    for identifier in string.gmatch(source, "([%a_][%w_]+)") do
+        local lowered = string.lower(identifier)
+        if #identifier >= 4 and not seenTerms[lowered] and #searchTerms < MAX_SEARCH_TERMS then
+            seenTerms[lowered] = true
+            table.insert(searchTerms, identifier)
+        end
+    end
+
+    return {
+        Requires = uniqueSorted(requires, 50),
+        ServicesUsed = uniqueSorted(servicesUsed, 30),
+        SearchTerms = uniqueSorted(searchTerms),
+        RemoteUsage = remoteUsage,
+        DataStoreUsage = dataStoreUsage,
+        Attributes = uniqueSorted(attributes, 50),
+        AttributeUsage = attributeUsage,
+        Functions = uniqueSorted(functions, 80),
+        Calls = uniqueSorted(calls, 120),
+        SourceHash = sourceFingerprint(originalSource),
+        SourceLength = #originalSource,
+        SourceLines = select(2, string.gsub(originalSource, "\\n", "")) + 1,
+        EvidenceQuality = "lexically-masked-regex",
+        LifecycleOwner = string.find(source, "Janitor", 1, true) and "Janitor" or
+            (string.find(source, "Trove", 1, true) and "Trove" or
+            (string.find(source, "Maid", 1, true) and "Maid" or "")),
+        HasTrackedCancellation = string.find(source, "task.cancel", 1, true) ~= nil,
+        UsesNetworkOwnership = string.find(source, "SetNetworkOwner", 1, true) ~= nil,
+        WritesAnchored = string.find(source, "%.Anchored%s*=") ~= nil,
+        UsesHotSignal = string.find(source, "RenderStepped", 1, true) ~= nil or
+            string.find(source, "Heartbeat", 1, true) ~= nil or
+            string.find(source, "Stepped", 1, true) ~= nil,
+        SourceReadable = true,
+    }
+end
+
+for _, category in categories do
+    local service = game:GetService(category)
+    local eligibleIndex = 0
+    local stack = {}
+    local rootChildren = service:GetChildren()
+    for index = #rootChildren, 1, -1 do
+        table.insert(stack, rootChildren[index])
+    end
+    while #stack > 0 do
+        local descendant = table.remove(stack)
+        if descendant:IsA("LuaSourceContainer") or descendant:IsA("RemoteEvent") or descendant:IsA("RemoteFunction") then
+            eligibleIndex += 1
+            if eligibleIndex > SCAN_OFFSET + SCAN_LIMIT then
+                hasMore = true
+                break
+            end
+            if eligibleIndex > SCAN_OFFSET and eligibleIndex <= SCAN_OFFSET + SCAN_LIMIT then
+                local item = {
+                    Name = descendant.Name,
+                    Class = descendant.ClassName,
+                    Parent = descendant.Parent and descendant.Parent.Name or "",
+                    Path = descendant:GetFullName(),
+                    Category = category,
+                }
+                if descendant:IsA("LuaSourceContainer") then
+                    local metadata = inspectSource(descendant)
+                    for key, value in metadata do
+                        item[key] = value
+                    end
+                end
+                local encodedItem = HttpService:JSONEncode(item)
+                local itemBytes = #encodedItem + 1
+                if encodedBytes + itemBytes > MAX_PAGE_BYTES then
+                    if #items > 0 then
+                        hasMore = true
+                        break
+                    end
+                    table.insert(oversizedItems, item.Path)
+                    encodedBytes += #HttpService:JSONEncode(item.Path) + 1
+                    item = {
+                        Name = item.Name,
+                        Class = item.Class,
+                        Parent = item.Parent,
+                        Path = item.Path,
+                        Category = item.Category,
+                        SourceReadable = item.SourceReadable,
+                        SourceHash = item.SourceHash,
+                        SourceLength = item.SourceLength,
+                        SourceLines = item.SourceLines,
+                        MetadataIncomplete = true,
+                    }
+                    encodedItem = HttpService:JSONEncode(item)
+                    itemBytes = #encodedItem + 1
+                end
+                table.insert(items, item)
+                encodedBytes += itemBytes
+            end
+        end
+        local children = descendant:GetChildren()
+        for index = #children, 1, -1 do
+            table.insert(stack, children[index])
+        end
+    end
+end
+
+local nextOffset = hasMore and SCAN_OFFSET + #items or nil
+
+return HttpService:JSONEncode({
+    Items = items,
+    NextOffset = nextOffset,
+    HasMore = hasMore,
+    EncodedBytes = encodedBytes,
+    OversizedItems = oversizedItems,
+})
+`;
+
+const SCAN_CATEGORIES = [
+    'ServerScriptService',
+    'ReplicatedStorage',
+    'StarterPlayer',
+    'StarterGui',
+    'ServerStorage',
+    'Workspace',
+    'StarterPack'
+];
+const SCAN_PAGE_SIZE = 150;
+const MAX_SCAN_PAGES_PER_CATEGORY = 40;
+
+export async function run(_args, studioCommunicator) {
+    let scanError = null;
+    let liveIdentity = null;
+
+    if (studioCommunicator?.isAlive()) {
+        try {
+            const placeIdentity = await executeLuau(studioCommunicator, `
+local HttpService = game:GetService("HttpService")
+return HttpService:JSONEncode({
+    Name = game.Name,
+    PlaceId = game.PlaceId,
+    GameId = game.GameId,
+    CreatorId = game.CreatorId,
+})
+`, { label: 'Project identity read' });
+            liveIdentity = placeIdentity;
+            const items = [];
+            const incompleteCategories = [];
+            const oversizedItems = [];
+            for (const category of SCAN_CATEGORIES) {
+                let offset = 0;
+                for (let page = 0; page < MAX_SCAN_PAGES_PER_CATEGORY; page += 1) {
+                    const result = await studioCommunicator.callTool('execute_luau', {
+                        code: buildScannerScript(category, offset),
+                        datamodel_type: 'Edit'
+                    });
+                    const chunk = parseStudioChunk(result);
+                    items.push(...chunk.Items);
+                    oversizedItems.push(...chunk.OversizedItems);
+                    if (chunk.NextOffset === null) break;
+                    offset = chunk.NextOffset;
+                    if (page === MAX_SCAN_PAGES_PER_CATEGORY - 1) {
+                        incompleteCategories.push({
+                            Category: category,
+                            ScannedEligibleItems: offset,
+                            PageLimit: MAX_SCAN_PAGES_PER_CATEGORY,
+                            PageSize: SCAN_PAGE_SIZE
+                        });
+                        break;
+                    }
+                }
+            }
+            const endingIdentity = await executeLuau(studioCommunicator, `
+local HttpService = game:GetService("HttpService")
+return HttpService:JSONEncode({
+    Name = game.Name,
+    PlaceId = game.PlaceId,
+    GameId = game.GameId,
+    CreatorId = game.CreatorId,
+})
+`, { label: 'Project identity revalidation' });
+            if (!placeIdentitiesMatch(endingIdentity, placeIdentity)) {
+                throw new Error('The active Studio place changed during the paginated scan.');
+            }
+            if (oversizedItems.length > 0) {
+                incompleteCategories.push({
+                    Category: 'EncodedMetadata',
+                    OversizedItems: oversizedItems.slice(0, 100),
+                    OversizedItemCount: oversizedItems.length,
+                    ByteLimit: 70_000
+                });
+            }
+            if (incompleteCategories.length > 0) {
+                const cached = loadBrain();
+                return JSON.stringify({
+                    Status: 'Live Scan Incomplete',
+                    PlaceIdentity: placeIdentity,
+                    IncompleteCategories: incompleteCategories,
+                    PartialItemCount: items.length,
+                    CachePreserved: true,
+                    Cache: cached.ok ? cacheMetadata(cached.brain, cached.staleSchema) : { Error: cached.error },
+                    SuggestedAction: 'Narrow the project or raise the explicit scan budget before replacing the cache.'
+                }, null, 2);
+            }
+            const brain = buildBrain(items, placeIdentity);
+            saveBrain(brain);
+            return JSON.stringify(formatBrainSummary(brain, true), null, 2);
+        } catch (error) {
+            scanError = error instanceof Error ? error.message : String(error);
+        }
+    } else {
+        scanError = 'Roblox Studio MCP is unavailable.';
+    }
+
+    const cached = loadBrain();
+    if (cached.ok) {
+        const cachedIdentity = cached.brain.PlaceIdentity;
+        const placeMismatch = liveIdentity && !placeIdentitiesMatch(cachedIdentity, liveIdentity);
+        if (placeMismatch) {
+            return JSON.stringify({
+                Status: 'Cached Brain Rejected',
+                Error: scanError,
+                PlaceMismatch: true,
+                LivePlaceIdentity: liveIdentity,
+                CachedPlaceIdentity: cachedIdentity || null,
+                SuggestedAction: 'Keep the intended place active and rerun analyze_project.'
+            }, null, 2);
+        }
+        return JSON.stringify({
+            ...formatBrainSummary(cached.brain, false, cached.staleSchema),
+            LiveScanError: scanError
+        }, null, 2);
+    }
+
+    return JSON.stringify({
+        Status: 'Scan Failed',
+        Error: scanError,
+        CacheError: cached.error,
+        SuggestedAction: 'Open Roblox Studio with its MCP connection active, then run analyze_project again.'
+    }, null, 2);
+}
+
+export function parseStudioItems(response) {
+    return parseStudioChunk(response).Items;
+}
+
+export function parseStudioChunk(response) {
+    if (response?.error) {
+        throw new Error(response.error.message || 'Studio scan returned an MCP error.');
+    }
+    const payload = response?.result ?? response;
+    const text = payload?.content?.find?.(entry => entry.type === 'text')?.text ??
+        payload?.content?.[0]?.text ??
+        payload;
+    let parsed = typeof text === 'string' ? JSON.parse(text) : text;
+    if (typeof parsed === 'string') parsed = JSON.parse(parsed);
+    if (Array.isArray(parsed)) {
+        return { Items: parsed, NextOffset: null };
+    }
+    if (!parsed || !Array.isArray(parsed.Items)) {
+        throw new Error('Studio scan returned an unexpected response instead of a scan page.');
+    }
+    const nextOffset = parsed.NextOffset === null || parsed.NextOffset === undefined
+        ? null
+        : Number(parsed.NextOffset);
+    if (nextOffset !== null && (!Number.isSafeInteger(nextOffset) || nextOffset < 0)) {
+        throw new Error('Studio scan returned an invalid pagination cursor.');
+    }
+    return {
+        Items: parsed.Items,
+        NextOffset: nextOffset,
+        HasMore: parsed.HasMore === true || nextOffset !== null,
+        EncodedBytes: Number(parsed.EncodedBytes || 0),
+        OversizedItems: Array.isArray(parsed.OversizedItems) ? parsed.OversizedItems.map(String) : []
+    };
+}
+
+export function buildScannerScript(category, offset) {
+    if (!SCAN_CATEGORIES.includes(category)) throw new Error(`Unsupported scan category '${category}'.`);
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('Scan offset must be a non-negative integer.');
+    return LUAU_SCANNER_SCRIPT
+        .replace('"__SCAN_CATEGORY__"', JSON.stringify(category))
+        .replace('__SCAN_OFFSET__', String(offset))
+        .replace('__SCAN_LIMIT__', String(SCAN_PAGE_SIZE));
+}
+
+function buildBrain(items, placeIdentity) {
+    const brain = {
+        SchemaVersion: BRAIN_SCHEMA_VERSION,
+        ScannedAt: new Date().toISOString(),
+        PlaceIdentity: placeIdentity,
+        AllItems: items
+    };
+    for (const category of ['ServerScriptService', 'ReplicatedStorage', 'StarterPlayer', 'StarterGui', 'ServerStorage', 'Workspace', 'StarterPack']) {
+        brain[category] = items.filter(item => item.Category === category);
+    }
+    return brain;
+}
+
+function formatBrainSummary(brain, isLive, staleSchema = false) {
+    const readableScripts = brain.AllItems.filter(item => item.SourceReadable === true).length;
+    return {
+        Status: isLive ? 'Live Scan Complete' : 'Cached Brain Loaded',
+        ...cacheMetadata(brain, staleSchema),
+        TotalScannedInstances: brain.AllItems.length,
+        SourceReadableScripts: readableScripts,
+        ScannedScopes: ['ServerScriptService', 'ReplicatedStorage', 'StarterPlayer', 'StarterGui', 'ServerStorage', 'Workspace', 'StarterPack'],
+        PlaceIdentity: brain.PlaceIdentity || null,
+        SystemsOverview: {
+            ServerScripts: (brain.ServerScriptService || []).length,
+            SharedModules: (brain.ReplicatedStorage || []).length,
+            ClientScripts: (brain.StarterPlayer || []).length,
+            UIElements: (brain.StarterGui || []).length,
+            Remotes: brain.AllItems.filter(item => ['RemoteEvent', 'RemoteFunction'].includes(item.Class)).length
+        }
+    };
+}

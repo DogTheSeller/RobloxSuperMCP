@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "roblox-super-mcp": {
+      "command": "node",
+      "args": [
+        "H:/TestingNEWMCP/server.js"
+      ]
+    }
+  }
+}
