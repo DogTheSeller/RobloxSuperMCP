@@ -11,6 +11,9 @@ export function parseStudioPayload(response, label = 'Studio operation') {
     const text = payload?.content?.find?.(entry => entry.type === 'text')?.text ??
         payload?.content?.[0]?.text ??
         payload;
+    if (payload?.isError) {
+        throw new Error(typeof text === 'string' && text.trim() ? text : `${label} returned an MCP error.`);
+    }
 
     if (typeof text !== 'string') return text;
     let parsed = text;
@@ -80,18 +83,62 @@ export function clampInteger(value, fallback, minimum, maximum) {
     return Math.min(maximum, Math.max(minimum, parsed));
 }
 
+export function selectStudioId(response, requestedId = '') {
+    const requested = String(requestedId || '').trim();
+    if (requested) return requested;
+    const payload = parseStudioPayload(response, 'Studio discovery');
+    const studios = Array.isArray(payload?.studios) ? payload.studios : [];
+    if (studios.length === 1 && studios[0]?.id) return String(studios[0].id);
+    if (studios.length === 0) throw new Error('No Roblox Studio instance is connected.');
+    throw new Error(`Multiple Roblox Studio instances are connected; provide studio_id (${studios.map(item => `${item.name}: ${item.id}`).join(', ')}).`);
+}
+
+export function normalizeOutputOptions(args = {}, {
+    defaultDetail = 'normal',
+    defaults = { compact: 8, normal: 25, deep: 50 },
+    maxResults = 200
+} = {}) {
+    const requestedDetail = String(args.detail || defaultDetail).toLowerCase();
+    const detail = ['compact', 'normal', 'deep'].includes(requestedDetail) ? requestedDetail : defaultDetail;
+    return {
+        detail,
+        maxResults: clampInteger(args.max_results ?? args.limit, defaults[detail], 1, maxResults),
+        maxChars: clampInteger(args.max_chars, 12_000, 1_000, 100_000)
+    };
+}
+
+export function stringifyBounded(payload, maxChars = 12_000, arrayKeys = []) {
+    const copy = structuredClone(payload);
+    let text = JSON.stringify(copy, null, 2);
+    if (text.length <= maxChars) return text;
+
+    let omitted = 0;
+    while (text.length > maxChars) {
+        const key = arrayKeys
+            .filter(candidate => Array.isArray(copy[candidate]) && copy[candidate].length > 0)
+            .sort((left, right) => copy[right].length - copy[left].length)[0];
+        if (!key) break;
+        copy[key].pop();
+        omitted += 1;
+        copy.Output = { Truncated: true, OmittedResults: omitted, MaxChars: maxChars };
+        text = JSON.stringify(copy, null, 2);
+    }
+
+    if (text.length <= maxChars) return text;
+    return JSON.stringify({
+        Status: copy.Status || 'Output Truncated',
+        Summary: copy.Summary || null,
+        Output: { Truncated: true, OmittedResults: omitted, MaxChars: maxChars },
+        SuggestedAction: 'Increase max_chars or narrow the query.'
+    }, null, 2);
+}
+
 export function luaString(value) {
     return JSON.stringify(String(value ?? ''));
 }
 
 export function luaJson(value) {
-    const json = JSON.stringify(value);
-    for (let equalsCount = 0; equalsCount < 12; equalsCount += 1) {
-        const equals = '='.repeat(equalsCount);
-        const close = `]${equals}]`;
-        if (!json.includes(close)) return `[${equals}[${json}]${equals}]`;
-    }
-    throw new Error('Unable to encode payload safely for Luau.');
+    return JSON.stringify(JSON.stringify(value));
 }
 
 export function sourceFingerprint(source) {
@@ -362,7 +409,6 @@ return HttpService:JSONEncode({
         if (!Number.isSafeInteger(nextPathIndex) || nextPathIndex < 1 ||
             nextPathIndex > uniquePaths.length ||
             !Number.isSafeInteger(nextSourceOffset) || nextSourceOffset < 0 ||
-            (nextPathIndex > cursor.PathIndex && nextSourceOffset !== 0) ||
             (nextPathIndex === cursor.PathIndex && nextSourceOffset <= cursor.SourceOffset)) {
             throw new Error('Source retrieval returned a non-advancing cursor.');
         }

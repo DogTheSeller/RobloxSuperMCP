@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const BRAIN_PATH = process.env.ROBLOX_SUPER_MCP_BRAIN_PATH ||
     path.join(__dirname, '..', 'project_brain.json');
-export const BRAIN_SCHEMA_VERSION = 4;
+export const BRAIN_SCHEMA_VERSION = 5;
 
 export function loadBrain() {
     if (!fs.existsSync(BRAIN_PATH)) {
@@ -71,7 +71,11 @@ export function normalizeItem(item) {
         Attributes: arrayOfStrings(item.Attributes),
         AttributeUsage: normalizeRecords(item.AttributeUsage, ['Name', 'Method']),
         Functions: arrayOfStrings(item.Functions),
+        FunctionDefinitions: normalizeRecords(item.FunctionDefinitions, ['Name', 'Line'])
+            .map(record => ({ ...record, Line: finiteNonNegative(record.Line) })),
         Calls: arrayOfStrings(item.Calls),
+        CallSites: normalizeRecords(item.CallSites, ['Name', 'Line'])
+            .map(record => ({ ...record, Line: finiteNonNegative(record.Line) })),
         SourceHash: String(item.SourceHash || ''),
         SourceLength: finiteNonNegative(item.SourceLength),
         SourceLines: finiteNonNegative(item.SourceLines),

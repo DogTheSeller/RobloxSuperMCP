@@ -1,7 +1,12 @@
 import { cacheMetadata, loadBrain } from './brain_store.js';
 import { buildDependencyGraph } from './graph_utils.js';
 import { findRankedItems, matchEvidence, tokenize } from './search_utils.js';
-import { normalizePagination, summarizeItem } from './studio_utils.js';
+import {
+    normalizeOutputOptions,
+    normalizePagination,
+    stringifyBounded,
+    summarizeItem
+} from './studio_utils.js';
 
 export async function run(args) {
     const task = String(args.task || '').trim();
@@ -14,8 +19,15 @@ export async function run(args) {
     const categories = Array.isArray(args.categories) ? new Set(args.categories.map(String)) : null;
     const ranked = findRankedItems(loaded.brain.AllItems, task, 500)
         .filter(({ item }) => !categories || categories.has(item.Category));
-    const { offset, limit } = normalizePagination(args, { defaultLimit: 25, maxLimit: 100 });
+    const output = normalizeOutputOptions(args, { maxResults: 100 });
+    const { offset, limit } = normalizePagination({ ...args, limit: output.maxResults }, {
+        defaultLimit: output.maxResults,
+        maxLimit: 100
+    });
     const graph = buildDependencyGraph(loaded.brain.AllItems);
+    const collectionLimit = output.detail === 'deep' ? 100 : 20;
+    const includeDependencies = args.include_dependencies ?? output.detail !== 'compact';
+    const includeRemotes = args.include_remotes ?? output.detail !== 'compact';
     const matches = ranked.slice(offset, offset + limit).map(({ item, match }) => ({
         RelevanceScore: match.score,
         MatchedTerms: match.matchedTokens,
@@ -27,11 +39,15 @@ export async function run(args) {
         RelevantFunctions: item.Functions.filter(name =>
             keywords.some(keyword => name.toLowerCase().includes(keyword))
         ),
-        Requires: item.Requires.slice(0, 100),
-        ServicesUsed: item.ServicesUsed.slice(0, 100),
-        RemoteUsage: item.RemoteUsage.slice(0, 100),
-        DirectDependencies: (graph.dependencies.get(item.Path) || []).slice(0, 100).map(summarizeItem),
-        DirectDependents: (graph.dependents.get(item.Path) || []).slice(0, 100).map(summarizeItem),
+        ...(output.detail === 'compact' ? {} : {
+            Requires: item.Requires.slice(0, collectionLimit),
+            ServicesUsed: item.ServicesUsed.slice(0, collectionLimit)
+        }),
+        ...(includeRemotes ? { RemoteUsage: item.RemoteUsage.slice(0, collectionLimit) } : {}),
+        ...(includeDependencies ? {
+            DirectDependencies: (graph.dependencies.get(item.Path) || []).slice(0, collectionLimit).map(summarizeItem),
+            DirectDependents: (graph.dependents.get(item.Path) || []).slice(0, collectionLimit).map(summarizeItem)
+        } : {}),
         CollectionCounts: {
             Requires: item.Requires.length,
             ServicesUsed: item.ServicesUsed.length,
@@ -39,11 +55,11 @@ export async function run(args) {
             DirectDependencies: (graph.dependencies.get(item.Path) || []).length,
             DirectDependents: (graph.dependents.get(item.Path) || []).length
         },
-        CollectionLimit: 100,
-        SourceHash: item.SourceHash || null
+        CollectionLimit: collectionLimit,
+        ...(output.detail === 'deep' ? { SourceHash: item.SourceHash || null } : {})
     }));
 
-    return JSON.stringify({
+    return stringifyBounded({
         Task: task,
         KeywordsAnalyzed: keywords,
         RelevantFiles: matches,
@@ -58,5 +74,5 @@ export async function run(args) {
         Suggestion: matches.length === 0
             ? 'Use a concrete module, remote, function, attribute, or gameplay noun.'
             : undefined
-    }, null, 2);
+    }, output.maxChars, ['RelevantFiles']);
 }

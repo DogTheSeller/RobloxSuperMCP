@@ -4,6 +4,8 @@ Roblox Super MCP is a Node.js MCP server that connects an MCP client to the
 official Roblox Studio MCP process. It adds discovery, inspection, auditing,
 atomic script edits, verification, and rollback-oriented tools.
 
+AI agents using the server should read and follow [`MCP_WORKFLOW.md`](MCP_WORKFLOW.md). It defines the required private snapshot, diff-only changelog, change-note, and visual-version workflow.
+
 ## Requirements
 
 - Windows
