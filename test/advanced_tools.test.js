@@ -7,8 +7,12 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const transactionDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'roblox-super-mcp-test-'));
+const historyDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'roblox-super-mcp-history-test-'));
+const sourceCacheDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'roblox-super-mcp-source-test-'));
 process.env.ROBLOX_SUPER_MCP_BRAIN_PATH = path.join(__dirname, 'fixture_brain.json');
 process.env.ROBLOX_SUPER_MCP_TRANSACTION_PATH = transactionDirectory;
+process.env.ROBLOX_SUPER_MCP_HISTORY_PATH = path.join(historyDirectory, 'project_history.json');
+process.env.ROBLOX_SUPER_MCP_SOURCE_CACHE_PATH = sourceCacheDirectory;
 
 const { SUPER_TOOLS, TOOL_HANDLERS } = await import('../tool_registry.js');
 const applyScriptPatch = await import('../tools/apply_script_patch.js');
@@ -19,9 +23,12 @@ const brainStore = await import('../tools/brain_store.js');
 const createArchitecture = await import('../tools/create_architecture.js');
 const detectRaceConditions = await import('../tools/detect_race_conditions.js');
 const findDeadCode = await import('../tools/find_dead_code.js');
+const findSymbol = await import('../tools/find_symbol.js');
 const generateChangePlan = await import('../tools/generate_change_plan.js');
 const getProjectSnapshot = await import('../tools/get_project_snapshot.js');
+const getRelatedCode = await import('../tools/get_related_code.js');
 const inspectInstance = await import('../tools/inspect_instance.js');
+const projectHistory = await import('../tools/project_history.js');
 const readScriptContext = await import('../tools/read_script_context.js');
 const remoteUtils = await import('../tools/remote_utils.js');
 const rollbackChange = await import('../tools/rollback_change.js');
@@ -102,11 +109,13 @@ function communicatorSequence(values) {
 
 test.after(() => {
     fs.rmSync(transactionDirectory, { recursive: true, force: true });
+    fs.rmSync(historyDirectory, { recursive: true, force: true });
+    fs.rmSync(sourceCacheDirectory, { recursive: true, force: true });
 });
 
-test('registry exposes 23 unique implemented custom tools', () => {
+test('registry exposes 29 unique implemented custom tools', () => {
     const names = SUPER_TOOLS.map(tool => tool.name);
-    assert.equal(names.length, 23);
+    assert.equal(names.length, 29);
     assert.equal(new Set(names).size, names.length);
     for (const name of names) {
         assert.equal(typeof TOOL_HANDLERS[name], 'function', `${name} has a handler`);
@@ -116,7 +125,8 @@ test('registry exposes 23 unique implemented custom tools', () => {
         'apply_script_patch', 'create_architecture', 'validate_remote_contract',
         'audit_lifecycle', 'audit_performance', 'audit_data_integrity',
         'detect_race_conditions', 'find_dead_code', 'generate_change_plan',
-        'verify_change', 'rollback_change'
+        'verify_change', 'rollback_change', 'refresh_project', 'find_symbol',
+        'save_project_snapshot', 'diff_project', 'record_project_change', 'lifecycle_graph'
     ]) {
         assert.ok(names.includes(expected), `${expected} is registered`);
     }
@@ -127,6 +137,14 @@ test('Studio payload parser unwraps nested JSON strings', () => {
         result: { content: [{ type: 'text', text: '"{\\"Ok\\":true}"' }] }
     });
     assert.deepEqual(parsed, { Ok: true });
+});
+
+test('Studio payload helpers use command-parser-safe JSON and surface MCP tool errors', () => {
+    const value = { text: 'quotes " and brackets ]]', lines: ['one', 'two'] };
+    assert.equal(JSON.parse(studioUtils.luaJson(value)), JSON.stringify(value));
+    assert.throws(() => studioUtils.parseStudioPayload({
+        result: { isError: true, content: [{ type: 'text', text: 'Failed to parse command code' }] }
+    }, 'Studio scan'), /Failed to parse command code/);
 });
 
 test('paged source retrieval assembles response-safe chunks', async () => {
@@ -209,6 +227,37 @@ test('paged source retrieval preserves UTF-8 byte cursors', async () => {
     assert.equal(records[0].Source, 'éx');
 });
 
+test('paged source retrieval can advance to a partially returned later script', async () => {
+    const base = {
+        ClassName: 'Script',
+        Truncated: false,
+        SourceHash: '6:test',
+        SourceLength: 6
+    };
+    const communicator = communicatorSequence([
+        {
+            Records: [
+                { ...base, Path: 'ServerScriptService.Small', Name: 'Small', SourceChunk: 'small!', SourceOffset: 0, ChunkComplete: true },
+                { ...base, Path: 'ServerScriptService.Big', Name: 'Big', SourceChunk: 'abc', SourceOffset: 0, ChunkComplete: false }
+            ],
+            Next: { PathIndex: 2, SourceOffset: 3 },
+            PlaceIdentity: TEST_PLACE_IDENTITY
+        },
+        {
+            Records: [
+                { ...base, Path: 'ServerScriptService.Big', Name: 'Big', SourceChunk: 'def', SourceOffset: 3, ChunkComplete: true }
+            ],
+            PlaceIdentity: TEST_PLACE_IDENTITY
+        }
+    ]);
+    const records = await studioUtils.fetchScriptSources(
+        communicator,
+        ['ServerScriptService.Small', 'ServerScriptService.Big'],
+        { maxScripts: 2 }
+    );
+    assert.deepEqual(records.map(record => record.Source), ['small!', 'abcdef']);
+});
+
 test('source retrieval aligns a truncated UTF-8 target before paging', async () => {
     let generatedCode = '';
     const communicator = {
@@ -275,6 +324,132 @@ test('project snapshot works from the indexed cache without Studio', async () =>
     assert.equal(result.Counts.TotalIndexedInstances, 5);
     assert.equal(result.Results.length, 2);
     assert.equal(result.Page.NextOffset, 2);
+});
+
+test('Studio targeting auto-selects one instance and rejects ambiguous sessions', () => {
+    const response = value => ({ result: { content: [{ type: 'text', text: JSON.stringify(value) }] } });
+    assert.equal(studioUtils.selectStudioId(response({ studios: [{ id: 'one', name: 'Place' }] })), 'one');
+    assert.throws(() => studioUtils.selectStudioId(response({
+        studios: [{ id: 'one', name: 'A' }, { id: 'two', name: 'B' }]
+    })), /provide studio_id/);
+});
+
+test('related-code compact mode obeys result and character budgets', async () => {
+    const text = await getRelatedCode.run({
+        task: 'trade',
+        detail: 'compact',
+        max_results: 1,
+        max_chars: 2_000
+    });
+    const result = JSON.parse(text);
+    assert.ok(text.length <= 2_000);
+    assert.equal(result.RelevantFiles.length, 1);
+    assert.equal(result.RelevantFiles[0].Requires, undefined);
+});
+
+test('symbol index resolves definitions and callers with line evidence', async () => {
+    const definition = JSON.parse(await findSymbol.run({
+        symbol: 'TradeService:AcceptOffer',
+        mode: 'definition'
+    }));
+    assert.equal(definition.Definitions[0].Line, 10);
+
+    const callers = JSON.parse(await findSymbol.run({ symbol: 'AcceptOffer', mode: 'callers' }));
+    assert.deepEqual(callers.Callers[0].Lines, [20]);
+});
+
+test('project history snapshots, journals, and summarizes structural diffs', async () => {
+    const saved = JSON.parse(await projectHistory.saveSnapshot({ label: 'start-of-day', version: 'alpha v1.0.0' }));
+    await projectHistory.recordChange({ change: 'Changed barking to woofing.', importance: 'important' });
+    const unchanged = JSON.parse(await projectHistory.diffProject({ snapshot_id: saved.SnapshotId }));
+    assert.equal(unchanged.Summary.Changed, 0);
+    assert.equal(unchanged.RecordedChanges[0].Importance, 'important');
+
+    const structural = projectHistory.compareProjectItems(
+        [
+            { Path: 'A.Old', Class: 'ModuleScript', SourceHash: 'same', SourceLines: 10 },
+            { Path: 'A.Live', Class: 'Script', SourceHash: 'old', SourceLines: 5, Functions: ['Old'] }
+        ],
+        [
+            { Path: 'A.New', Class: 'ModuleScript', SourceHash: 'same', SourceLines: 10 },
+            { Path: 'A.Live', Class: 'Script', SourceHash: 'new', SourceLines: 8, Functions: ['New'] }
+        ]
+    );
+    assert.equal(structural.Summary.Moved, 1);
+    assert.equal(structural.Summary.Changed, 1);
+    assert.equal(structural.Summary.LinesAdded, 3);
+});
+
+test('private source diff returns only numbered changed lines', () => {
+    const result = projectHistory.createSourceDiff(
+        'ServerScriptService.PlotManager',
+        ['local value = 1', 'oldCall()', 'return value'].join('\n'),
+        ['local value = 1', 'newCall()', 'extraCall()', 'return value'].join('\n')
+    );
+    assert.equal(result.LinesAdded, 2);
+    assert.equal(result.LinesRemoved, 1);
+    assert.deepEqual(result.Hunks.flatMap(hunk => hunk.Lines), [
+        '-2 oldCall()',
+        '+2 newCall()',
+        '+3 extraCall()'
+    ]);
+    assert.equal(JSON.stringify(result).includes('local value = 1'), false);
+    assert.equal(JSON.stringify(result).includes('return value'), false);
+});
+
+test('changing the visual version rotates only after a complete private source capture', async () => {
+    const sourceRecords = [
+        ['ReplicatedStorage.Trade.TradeConfig', 'TradeConfig', 'ModuleScript'],
+        ['ServerScriptService.Services.TradeService', 'TradeService', 'ModuleScript'],
+        ['StarterPlayer.StarterPlayerScripts.TradingClient', 'TradingClient', 'ModuleScript'],
+        ['StarterGui.Main.Trading.TradeMenu', 'TradeMenu', 'LocalScript']
+    ].map(([Path, Name, ClassName]) => ({
+        Path,
+        Name,
+        ClassName,
+        Source: 'return {}',
+        SourceHash: '9:test',
+        SourceLength: 9
+    }));
+    const first = JSON.parse(await projectHistory.saveSnapshot(
+        { label: 'first', version: 'alpha v1.0.0', refresh: false },
+        communicatorReturning(sourceRecords)
+    ));
+    const second = JSON.parse(await projectHistory.saveSnapshot(
+        { label: 'second', version: 'alpha v1.0.1', refresh: false },
+        communicatorReturning(sourceRecords)
+    ));
+    assert.equal(first.SourceBaseline.Captured, true);
+    assert.equal(first.SourceBaseline.Complete, true);
+    assert.equal(second.SourceBaseline.Captured, true);
+    assert.equal(second.SourceBaseline.Complete, true);
+    assert.deepEqual(fs.readdirSync(sourceCacheDirectory), [`${second.SnapshotId}.json`]);
+
+    const incomplete = JSON.parse(await projectHistory.saveSnapshot(
+        { label: 'incomplete', version: 'beta v1.0.0', refresh: false },
+        communicatorReturning(sourceRecords.slice(0, 1))
+    ));
+    assert.equal(incomplete.SourceBaseline.Complete, false);
+    assert.deepEqual(fs.readdirSync(sourceCacheDirectory).sort(), [
+        `${second.SnapshotId}.json`,
+        `${incomplete.SnapshotId}.json`
+    ].sort());
+});
+
+test('lifecycle graph maps visible disconnect and cancellation ownership', () => {
+    const graph = auditLifecycle.buildLifecycleGraph({
+        Path: 'ServerScriptService.PlotManager',
+        Source: [
+            'local connection = Players.PlayerAdded:Connect(onPlayer)',
+            'local updateThread = task.spawn(UpdatePlots)',
+            'connection:Disconnect()',
+            'task.cancel(updateThread)',
+            'RunService.Heartbeat:Connect(render)'
+        ].join('\n')
+    });
+    assert.equal(graph.Summary.OwnedConnections, 1);
+    assert.equal(graph.Summary.UnownedConnections, 1);
+    assert.equal(graph.Summary.CancelledTasks, 1);
 });
 
 test('instance inspection parses bounded live Studio evidence', async () => {

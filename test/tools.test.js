@@ -27,12 +27,18 @@ test('live scan parser unwraps native JSON-RPC tool envelopes', () => {
 });
 
 test('scanner builds bounded category pages without unresolved placeholders', () => {
-    const code = analyzeProject.buildScannerScript('ReplicatedStorage', 30);
+    const code = analyzeProject.buildScannerScript('ReplicatedStorage', 30, [{
+        Path: 'ReplicatedStorage.TradeConfig',
+        Class: 'ModuleScript',
+        SourceHash: '10:abc'
+    }]);
     assert.ok(code.includes('local SCAN_CATEGORY = "ReplicatedStorage"'));
     assert.ok(code.includes('local SCAN_OFFSET = 30'));
     assert.ok(code.includes('local SCAN_LIMIT = 150'));
     assert.ok(code.includes('local MAX_PAGE_BYTES = 70000'));
     assert.ok(code.includes('HttpService:JSONEncode(item)'));
+    assert.ok(code.includes('known.SourceHash == sourceFingerprint(source)'));
+    assert.ok(code.includes('ReplicatedStorage.TradeConfig'));
     assert.equal(code.includes('__SCAN_'), false);
 });
 

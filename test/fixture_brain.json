@@ -1,5 +1,5 @@
 {
-  "SchemaVersion": 4,
+  "SchemaVersion": 5,
   "ScannedAt": "2026-07-30T00:00:00.000Z",
   "PlaceIdentity": {
     "Name": "SuperMCP Test Place",
@@ -31,7 +31,9 @@
         {"Name": "TradeEvent", "Symbol": "tradeRemote", "Method": "FireClient"}
       ],
       "DataStoreUsage": [{"Name": "PlayerTrades", "Method": "GetDataStore"}],
-      "Functions": ["TradeService.AcceptOffer"]
+      "Functions": ["TradeService.AcceptOffer"],
+      "FunctionDefinitions": [{"Name": "TradeService.AcceptOffer", "Line": 10}],
+      "SourceLines": 100
     },
     {
       "Name": "TradingClient",
@@ -41,6 +43,9 @@
       "SourceReadable": true,
       "SourceHash": "y",
       "Requires": ["TradeService"],
+      "Calls": ["AcceptOffer"],
+      "CallSites": [{"Name": "AcceptOffer", "Line": 20}],
+      "SourceLines": 60,
       "RemoteUsage": [
         {"Name": "TradeEvent", "Symbol": "tradeRemote", "Method": "FireServer"},
         {"Name": "TradeEvent", "Symbol": "tradeRemote", "Method": "OnClientEvent"}

@@ -6,6 +6,7 @@ import os from 'os';
 import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import { SUPER_TOOLS, TOOL_HANDLERS } from './tool_registry.js';
+import { selectStudioId } from './tools/studio_utils.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -120,6 +121,24 @@ function failPendingStudioRequests(message) {
     studioFailure = message;
 }
 
+async function resolveStudioId(requestedId) {
+    if (requestedId) return String(requestedId);
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+        const response = await queryStudioMCP({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'tools/call',
+            params: { name: 'list_roblox_studios', arguments: {} }
+        });
+        try {
+            return selectStudioId(response);
+        } catch (error) {
+            if (!String(error.message).startsWith('No Roblox Studio') || attempt === 9) throw error;
+            await new Promise(resolve => setTimeout(resolve, 300));
+        }
+    }
+}
+
 // 3. Stdio Communication with AI Client
 const rl = readline.createInterface({
     input: process.stdin,
@@ -190,15 +209,17 @@ rl.on('line', async (line) => {
             if (toolName && TOOL_HANDLERS[toolName]) {
                 const handler = TOOL_HANDLERS[toolName];
                 const toolArguments = request.params.arguments || {};
+                let studioIdPromise = null;
                 const communicator = {
                     isAlive: () => Boolean(studioProc?.stdin.writable),
                     callTool: async (name, args, timeoutMs = 20_000) => {
                         await studioReadyPromise;
+                        studioIdPromise ||= resolveStudioId(toolArguments.studio_id);
                         return queryStudioMCP({
                             jsonrpc: "2.0",
                             id: 1,
                             method: "tools/call",
-                            params: { name, arguments: args }
+                            params: { name, arguments: { ...args, studio_id: await studioIdPromise } }
                         }, timeoutMs);
                     }
                 };

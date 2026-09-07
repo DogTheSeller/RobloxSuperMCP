@@ -20,7 +20,7 @@ const TREE_ROOTS = [
 export async function run(args = {}, studioCommunicator) {
     let refreshResult = null;
     if (args.refresh === true) {
-        refreshResult = JSON.parse(await analyzeProject.run({}, studioCommunicator));
+        refreshResult = JSON.parse(await analyzeProject.refresh({}, studioCommunicator));
     }
 
     const loaded = loadBrain();
